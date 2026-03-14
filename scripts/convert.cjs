@@ -17,7 +17,6 @@ const { PDFDocument } = require('pdf-lib');
 const path = require('path');
 const https = require('https');
 const http = require('http');
-const { execSync } = require('child_process');
 
 // ─── CLI argument parsing ────────────────────────────────────────────────────
 
@@ -79,34 +78,109 @@ console.log(`   Title: ${title} | Author: ${author} | Version: ${version}`);
 
 // ─── Gemini Pro image generation ─────────────────────────────────────────────
 
+/**
+ * Call Gemini image generation API directly via Node.js HTTPS.
+ * Supports proxy via GEMINI_PRO_PROXY env var.
+ * Model: gemini-3-pro-image-preview (high quality, ~60-180s)
+ */
 async function generateCoverWithGemini(prompt, outputImagePath) {
   if (!geminiKey) {
     console.warn('⚠️  GEMINI_API_KEY not set, skipping cover generation');
     return null;
   }
 
-  // Find gemini-imagegen skill script relative to this skill
-  const skillRoot = path.resolve(__dirname, '../../');
-  const geminiScript = path.join(skillRoot, 'gemini-imagegen', 'scripts', 'imagegen.py');
-
-  if (!existsSync(geminiScript)) {
-    console.warn(`⚠️  gemini-imagegen skill not found at ${geminiScript}, skipping cover`);
-    return null;
-  }
-
   console.log('🎨 Generating cover image with Gemini Pro...');
+
+  const MODEL = 'gemini-3-pro-image-preview';
+  const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${geminiKey}`;
+
+  const body = JSON.stringify({
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { responseModalities: ['IMAGE', 'TEXT'] }
+  });
+
   try {
-    const proxyEnv = geminiProxy ? `GEMINI_PRO_PROXY=${geminiProxy}` : '';
-    const cmd = `${proxyEnv} GEMINI_API_KEY=${geminiKey} uv run "${geminiScript}" --prompt "${prompt.replace(/"/g, '\\"')}" --filename "${outputImagePath}" --model pro --timeout 600`;
-    execSync(cmd, { stdio: 'inherit', timeout: 660000 });
-    if (existsSync(outputImagePath)) {
-      console.log(`✅ Cover image saved: ${outputImagePath}`);
-      return outputImagePath;
-    }
+    const imageBytes = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Gemini API timeout (600s)')), 600000);
+
+      // Parse proxy if set
+      let reqOptions;
+      if (geminiProxy) {
+        const proxyUrl = new URL(geminiProxy);
+        const targetUrl = new URL(API_URL);
+        // Use CONNECT tunnel via proxy
+        const tunnelReq = http.request({
+          host: proxyUrl.hostname,
+          port: parseInt(proxyUrl.port) || 8080,
+          method: 'CONNECT',
+          path: `${targetUrl.hostname}:443`,
+        });
+        tunnelReq.on('connect', (res, socket) => {
+          if (res.statusCode !== 200) {
+            clearTimeout(timeout);
+            return reject(new Error(`Proxy CONNECT failed: ${res.statusCode}`));
+          }
+          const req = https.request({
+            host: targetUrl.hostname,
+            path: targetUrl.pathname + targetUrl.search,
+            method: 'POST',
+            socket,
+            agent: false,
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+          }, handleResponse);
+          req.on('error', e => { clearTimeout(timeout); reject(e); });
+          req.write(body);
+          req.end();
+        });
+        tunnelReq.on('error', e => { clearTimeout(timeout); reject(e); });
+        tunnelReq.end();
+        return;
+      }
+
+      // No proxy — direct HTTPS
+      const targetUrl = new URL(API_URL);
+      const req = https.request({
+        hostname: targetUrl.hostname,
+        path: targetUrl.pathname + targetUrl.search,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+      }, handleResponse);
+      req.on('error', e => { clearTimeout(timeout); reject(e); });
+      req.write(body);
+      req.end();
+
+      function handleResponse(res) {
+        const chunks = [];
+        res.on('data', c => chunks.push(c));
+        res.on('end', () => {
+          clearTimeout(timeout);
+          try {
+            const data = JSON.parse(Buffer.concat(chunks).toString());
+            if (data.error) return reject(new Error(data.error.message || JSON.stringify(data.error)));
+            // Find image part
+            for (const candidate of (data.candidates || [])) {
+              for (const part of (candidate.content?.parts || [])) {
+                if (part.inlineData?.mimeType?.startsWith('image/')) {
+                  return resolve(Buffer.from(part.inlineData.data, 'base64'));
+                }
+              }
+            }
+            reject(new Error('No image in Gemini response: ' + JSON.stringify(data).slice(0, 200)));
+          } catch (e) { reject(e); }
+        });
+        res.on('error', e => { clearTimeout(timeout); reject(e); });
+      }
+    });
+
+    require('fs').writeFileSync(outputImagePath, imageBytes);
+    const sizeMB = (imageBytes.length / 1024 / 1024).toFixed(2);
+    console.log(`✅ Cover image saved: ${outputImagePath} (${sizeMB} MB)`);
+    return outputImagePath;
+
   } catch (e) {
     console.warn(`⚠️  Cover generation failed: ${e.message}`);
+    return null;
   }
-  return null;
 }
 
 // ─── Mermaid JS (bundled inline) ──────────────────────────────────────────────

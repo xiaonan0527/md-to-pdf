@@ -1,0 +1,11 @@
+{
+  "name": "md-to-pdf-scripts",
+  "version": "1.0.0",
+  "description": "Scripts for md-to-pdf skill",
+  "private": true,
+  "dependencies": {
+    "marked": "^15.0.0",
+    "pdf-lib": "^1.17.1",
+    "puppeteer": "^24.0.0"
+  }
+}
